@@ -35,12 +35,10 @@ class PaperExchange:
             if order.price < token_book.best_ask:
                 return None
             liquidity = token_book.ask_size
-            execution_price = token_book.best_ask
         else:
             if order.price > token_book.best_bid:
                 return None
             liquidity = token_book.bid_size
-            execution_price = token_book.best_bid
 
         fill_size = min(remaining, liquidity) if self.allow_partial_fills else remaining
         if fill_size <= 0:
@@ -50,7 +48,7 @@ class PaperExchange:
             order_id=order.order_id,
             token=order.token,
             side=order.side,
-            price=execution_price,
+            price=order.price,
             size=round(fill_size, 8),
         )
         self.logger.info(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,13 @@ class BotConfig:
 
     log_file: str = "logs/bot.log"
     random_seed: int | None = 42
+
+    market_data_mode: Literal["mock", "polymarket"] = "mock"
+    gamma_base_url: str = "https://gamma-api.polymarket.com"
+    clob_base_url: str = "https://clob.polymarket.com"
+    btc_market_query: str = "btc 15m bitcoin"
+    market_refresh_seconds: float = 60.0
+    http_timeout_seconds: float = 10.0
 
 
 DEFAULT_CONFIG = BotConfig()

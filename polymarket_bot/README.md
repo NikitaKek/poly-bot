@@ -13,6 +13,7 @@ polymarket_bot/
   main.py
   config.py
   market_data.py
+  polymarket_market_data.py
   order_manager.py
   position_manager.py
   risk_manager.py
@@ -60,6 +61,12 @@ Run continuously until `Ctrl+C`:
 python -m polymarket_bot.main --iterations 0
 ```
 
+Run with public Polymarket market data while keeping paper-only execution:
+
+```bash
+python -m polymarket_bot.main --market-data-mode polymarket --iterations 0
+```
+
 Logs are written to:
 
 ```text
@@ -71,12 +78,33 @@ logs/bot.log
 - `models.py`: dataclasses and enums for tokens, sides, orders, fills, and market snapshots.
 - `config.py`: conservative paper-trading defaults and risk limits.
 - `market_data.py`: mock market data generator for YES/NO tokens where `YES + NO ~= 1`.
+- `polymarket_market_data.py`: public Gamma market discovery and public CLOB order book snapshots.
 - `paper_exchange.py`: paper limit-order execution against the current best bid/ask.
 - `order_manager.py`: places, cancels, stores, and updates paper orders.
 - `position_manager.py`: tracks cash, spot YES/NO inventory, average cost, fills, realized PnL, unrealized PnL, and equity.
 - `risk_manager.py`: validates price, size, cash, spot inventory, open-order exposure, and inventory imbalance limits before orders are accepted.
 - `logger.py`: logs to console and `logs/bot.log`.
 - `main.py`: runs the paper-trading loop and places simple test quotes.
+
+## Market Data Modes
+
+The bot supports two market data modes:
+
+- `mock`: local random YES/NO snapshots. This is the default.
+- `polymarket`: public read-only Polymarket data from Gamma and CLOB.
+
+Polymarket mode uses:
+
+- Gamma base URL: `https://gamma-api.polymarket.com`
+- CLOB base URL: `https://clob.polymarket.com`
+- Gamma filters: `active=true`, `closed=false`
+
+It first generates timestamp-based BTC 15-minute slugs such as
+`btc-updown-15m-1778410800`, fetches them through Gamma event/market slug
+endpoints, then falls back to scanning active Gamma market `question`/`slug`
+values for BTC/Bitcoin and 15m/15-minute signals. `clobTokenIds` are read as
+`[YES token id, NO token id]`. No private key, API key, order signing, or
+authenticated endpoint is used.
 
 ## Paper Fill Logic
 
@@ -85,9 +113,17 @@ A paper order fills when it crosses the current top of book:
 - `BUY` fills when `order.price >= current_best_ask`
 - `SELL` fills when `order.price <= current_best_bid`
 
+Paper fills are intentionally conservative: execution price is the order's
+limit price, not the currently available best bid or ask.
+
 The current implementation supports simplified partial fills by limiting the
 fill size to available top-of-book size. If the top size is larger than the
 remaining order size, the order is fully filled.
+
+Before placing a fresh set of test quotes, the bot cancels all stale open or
+partially filled orders. The test strategy always considers BUY quotes, but it
+only proposes SELL quotes when current spot inventory can cover the full order
+size.
 
 ## Spot Accounting
 
