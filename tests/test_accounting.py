@@ -8,10 +8,15 @@ from datetime import timedelta
 
 from polymarket_bot.config import BotConfig
 from polymarket_bot.main import (
+    _attempt_forced_exit,
+    _forced_exit_required,
     _place_test_orders,
+    _handle_stale_market_lifecycle,
+    _inventory_skew_ratio,
     _new_positions_blocked,
     _seconds_to_expiry,
     cancel_all_open_orders,
+    cancel_open_orders_for_condition,
     cancel_open_orders_not_for_condition,
 )
 from polymarket_bot.models import (
@@ -40,6 +45,16 @@ def risk_limits() -> RiskLimits:
         max_position_per_token=1_000.0,
         max_inventory_imbalance=1_000.0,
         max_order_size=1_000.0,
+        min_price=0.01,
+        max_price=0.99,
+    )
+
+
+def small_order_risk_limits(max_order_size: float = 10.0) -> RiskLimits:
+    return RiskLimits(
+        max_position_per_token=1_000.0,
+        max_inventory_imbalance=1_000.0,
+        max_order_size=max_order_size,
         min_price=0.01,
         max_price=0.99,
     )
@@ -217,6 +232,46 @@ class SpotAccountingTests(unittest.TestCase):
         open_orders = self.order_manager.get_open_orders()
         self.assertTrue(any(order.token == Token.YES and order.side == Side.SELL for order in open_orders))
 
+    def test_inventory_skew_blocks_buy_yes_and_prefers_sell_yes_when_yes_heavy(self) -> None:
+        snapshot = sample_snapshot()
+        self.position_manager.apply_fill(
+            sample_fill(Token.YES, Side.BUY, price=0.40, size=30.0, order_id="buy")
+        )
+
+        _place_test_orders(
+            snapshot=snapshot,
+            order_manager=self.order_manager,
+            position_manager=self.position_manager,
+            config=BotConfig(default_order_size=5.0, max_inventory_imbalance=50.0),
+        )
+
+        open_orders = self.order_manager.get_open_orders()
+        self.assertFalse(any(order.token == Token.YES and order.side == Side.BUY for order in open_orders))
+        self.assertTrue(any(order.token == Token.YES and order.side == Side.SELL for order in open_orders))
+        self.assertTrue(any(order.token == Token.NO and order.side == Side.BUY for order in open_orders))
+
+    def test_inventory_skew_blocks_buy_no_and_prefers_sell_no_when_no_heavy(self) -> None:
+        snapshot = sample_snapshot()
+        self.position_manager.apply_fill(
+            sample_fill(Token.NO, Side.BUY, price=0.60, size=30.0, order_id="buy")
+        )
+
+        _place_test_orders(
+            snapshot=snapshot,
+            order_manager=self.order_manager,
+            position_manager=self.position_manager,
+            config=BotConfig(default_order_size=5.0, max_inventory_imbalance=50.0),
+        )
+
+        open_orders = self.order_manager.get_open_orders()
+        self.assertFalse(any(order.token == Token.NO and order.side == Side.BUY for order in open_orders))
+        self.assertTrue(any(order.token == Token.NO and order.side == Side.SELL for order in open_orders))
+        self.assertTrue(any(order.token == Token.YES and order.side == Side.BUY for order in open_orders))
+
+    def test_inventory_skew_ratio_handles_disabled_limit(self) -> None:
+        self.assertEqual(_inventory_skew_ratio(10.0, 0.0), 0.0)
+        self.assertAlmostEqual(_inventory_skew_ratio(25.0, 50.0), 0.5)
+
     def test_cancel_all_open_orders_cancels_open_and_partial_orders(self) -> None:
         snapshot = sample_snapshot()
         open_order = self.order_manager.place_limit_order(snapshot, Token.YES, Side.BUY, price=0.39, size=5.0)
@@ -231,6 +286,82 @@ class SpotAccountingTests(unittest.TestCase):
         self.assertEqual(open_order.status, OrderStatus.CANCELLED)
         self.assertEqual(partial_order.status, OrderStatus.CANCELLED)
         self.assertEqual(self.order_manager.get_open_orders(), [])
+
+    def test_session_shutdown_cancels_open_orders(self) -> None:
+        snapshot = sample_snapshot()
+        open_order = self.order_manager.place_limit_order(snapshot, Token.YES, Side.BUY, price=0.39, size=5.0)
+
+        cancelled_count = cancel_all_open_orders(
+            self.order_manager,
+            cancel_reason="session_shutdown",
+        )
+
+        self.assertEqual(cancelled_count, 1)
+        self.assertEqual(open_order.status, OrderStatus.CANCELLED)
+        self.assertEqual(self.order_manager.get_open_orders(), [])
+
+    def test_cancel_open_orders_for_condition_keeps_other_markets(self) -> None:
+        old_snapshot = sample_snapshot("condition-a", "market-a", "yes-a", "no-a")
+        new_snapshot = sample_snapshot("condition-b", "market-b", "yes-b", "no-b")
+        old_order = self.order_manager.place_limit_order(old_snapshot, Token.YES, Side.BUY, 0.39, 5.0)
+        new_order = self.order_manager.place_limit_order(new_snapshot, Token.YES, Side.BUY, 0.39, 5.0)
+
+        cancelled = cancel_open_orders_for_condition(self.order_manager, old_snapshot.condition_id)
+
+        self.assertEqual(cancelled, 1)
+        self.assertEqual(old_order.status, OrderStatus.CANCELLED)
+        self.assertEqual(new_order.status, OrderStatus.OPEN)
+
+    def test_stale_market_lifecycle_cancels_orders_near_expiry_without_snapshot(self) -> None:
+        snapshot = sample_snapshot(expires_in_seconds=140.0)
+        order = self.order_manager.place_limit_order(snapshot, Token.YES, Side.BUY, price=0.39, size=5.0)
+
+        _handle_stale_market_lifecycle(
+            last_snapshot=snapshot,
+            order_manager=self.order_manager,
+            position_manager=self.position_manager,
+            logger=self.logger,
+            iteration=1,
+        )
+
+        self.assertEqual(order.status, OrderStatus.CANCELLED)
+        self.assertEqual(self.order_manager.get_open_orders(), [])
+
+    def test_stale_market_lifecycle_does_not_cancel_before_cancel_threshold(self) -> None:
+        snapshot = sample_snapshot(expires_in_seconds=170.0)
+        order = self.order_manager.place_limit_order(snapshot, Token.YES, Side.BUY, price=0.39, size=5.0)
+
+        _handle_stale_market_lifecycle(
+            last_snapshot=snapshot,
+            order_manager=self.order_manager,
+            position_manager=self.position_manager,
+            logger=self.logger,
+            iteration=1,
+        )
+
+        self.assertEqual(order.status, OrderStatus.OPEN)
+
+    def test_stale_market_lifecycle_archives_expired_inventory_without_snapshot(self) -> None:
+        snapshot = sample_snapshot(expires_in_seconds=-1.0)
+        self.position_manager.ensure_market(snapshot)
+        self.position_manager.apply_fill(
+            sample_fill(Token.NO, Side.BUY, price=0.60, size=10.0, order_id="buy")
+        )
+
+        _handle_stale_market_lifecycle(
+            last_snapshot=snapshot,
+            order_manager=self.order_manager,
+            position_manager=self.position_manager,
+            logger=self.logger,
+            iteration=1,
+        )
+
+        market_position = self.position_manager.get_market_position(snapshot.condition_id)
+        self.assertTrue(market_position.unresolved_inventory)
+        self.assertEqual(
+            market_position.unresolved_reason,
+            "market data unavailable through expiry; inventory could not be settled or exited",
+        )
 
     def test_paper_exchange_buy_fill_uses_order_price(self) -> None:
         exchange = PaperExchange(logger=self.logger)
@@ -317,11 +448,108 @@ class SpotAccountingTests(unittest.TestCase):
         self.assertEqual(market_a.yes_position, 5.0)
         self.assertEqual(market_b.yes_position, 0.0)
 
+    def test_forced_exit_chunks_large_yes_inventory_into_max_order_size(self) -> None:
+        snapshot = sample_snapshot()
+        order_manager, position_manager = self._small_order_size_components(max_order_size=10.0)
+        position_manager.ensure_market(snapshot)
+        position_manager.apply_fill(
+            sample_fill(Token.YES, Side.BUY, price=0.40, size=21.3, order_id="buy")
+        )
+
+        _attempt_forced_exit(
+            snapshot=snapshot,
+            order_manager=order_manager,
+            position_manager=position_manager,
+            logger=self.logger,
+            max_exit_order_size=10.0,
+        )
+
+        sell_orders = [
+            order
+            for order in order_manager.get_all_orders()
+            if order.side == Side.SELL and order.outcome == Token.YES
+        ]
+        self.assertEqual([order.size for order in sell_orders], [10.0, 10.0, 1.3])
+        self.assertTrue(all(order.size <= 10.0 for order in sell_orders))
+        self.assertAlmostEqual(position_manager.get_position(snapshot.condition_id, Token.YES), 0.0)
+
+    def test_forced_exit_chunks_large_no_inventory_into_max_order_size(self) -> None:
+        snapshot = sample_snapshot()
+        order_manager, position_manager = self._small_order_size_components(max_order_size=10.0)
+        position_manager.ensure_market(snapshot)
+        position_manager.apply_fill(
+            sample_fill(Token.NO, Side.BUY, price=0.60, size=18.7, order_id="buy")
+        )
+
+        _attempt_forced_exit(
+            snapshot=snapshot,
+            order_manager=order_manager,
+            position_manager=position_manager,
+            logger=self.logger,
+            max_exit_order_size=10.0,
+        )
+
+        sell_orders = [
+            order
+            for order in order_manager.get_all_orders()
+            if order.side == Side.SELL and order.outcome == Token.NO
+        ]
+        self.assertEqual([order.size for order in sell_orders], [10.0, 8.7])
+        self.assertTrue(all(order.size <= 10.0 for order in sell_orders))
+        self.assertAlmostEqual(position_manager.get_position(snapshot.condition_id, Token.NO), 0.0)
+
+    def test_chunked_forced_exit_does_not_create_order_larger_than_max_order_size(self) -> None:
+        snapshot = sample_snapshot()
+        order_manager, position_manager = self._small_order_size_components(max_order_size=10.0)
+        position_manager.ensure_market(snapshot)
+        position_manager.apply_fill(
+            sample_fill(Token.YES, Side.BUY, price=0.40, size=21.3, order_id="buy-yes")
+        )
+        position_manager.apply_fill(
+            sample_fill(Token.NO, Side.BUY, price=0.60, size=18.7, order_id="buy-no")
+        )
+
+        _attempt_forced_exit(
+            snapshot=snapshot,
+            order_manager=order_manager,
+            position_manager=position_manager,
+            logger=self.logger,
+            max_exit_order_size=10.0,
+        )
+
+        sell_orders = [order for order in order_manager.get_all_orders() if order.side == Side.SELL]
+        self.assertTrue(sell_orders)
+        self.assertTrue(all(order.size <= 10.0 for order in sell_orders))
+
     def test_forced_exit_blocks_new_orders_near_expiry(self) -> None:
         snapshot = sample_snapshot(expires_in_seconds=30.0)
 
         self.assertIsNotNone(_seconds_to_expiry(snapshot))
         self.assertTrue(_new_positions_blocked(snapshot))
+
+    def test_expiry_threshold_blocks_new_positions_earlier(self) -> None:
+        snapshot = sample_snapshot(expires_in_seconds=170.0)
+
+        self.assertTrue(_new_positions_blocked(snapshot))
+
+    def test_expiry_cancel_threshold_triggers_earlier(self) -> None:
+        snapshot = sample_snapshot(expires_in_seconds=140.0)
+
+        self.assertTrue(_forced_exit_required(snapshot))
+
+    def _small_order_size_components(self, max_order_size: float) -> tuple[OrderManager, PositionManager]:
+        position_manager = PositionManager(logger=self.logger, initial_cash=1_000.0)
+        risk_manager = RiskManager(
+            limits=small_order_risk_limits(max_order_size),
+            position_manager=position_manager,
+            logger=self.logger,
+        )
+        order_manager = OrderManager(
+            paper_exchange=PaperExchange(logger=self.logger),
+            logger=self.logger,
+            risk_manager=risk_manager,
+        )
+        return order_manager, position_manager
 
 
 if __name__ == "__main__":

@@ -19,6 +19,9 @@ class BotConfig:
     market_update_interval_seconds: float = 2.0
     default_order_size: float = 5.0
     strategy_quote_offset: float = 0.01
+    inventory_skew_disable_ratio: float = 0.50
+    expiry_block_new_seconds: float = 180.0
+    expiry_cancel_seconds: float = 150.0
     max_iterations: int | None = None
 
     max_position_per_token: float = 100.0

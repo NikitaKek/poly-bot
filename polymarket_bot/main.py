@@ -32,8 +32,8 @@ from .polymarket_market_data import (
 )
 from .risk_manager import RiskLimits, RiskManager
 
-FORCED_EXIT_BLOCK_NEW_SECONDS = 90.0
-FORCED_EXIT_CANCEL_SECONDS = 60.0
+FORCED_EXIT_BLOCK_NEW_SECONDS = DEFAULT_CONFIG.expiry_block_new_seconds
+FORCED_EXIT_CANCEL_SECONDS = DEFAULT_CONFIG.expiry_cancel_seconds
 
 
 class MarketDataProvider(Protocol):
@@ -222,6 +222,7 @@ def _build_session_summary(
             "total_orders": len(order_manager.get_all_orders()),
             "total_fills": len(position_manager.fills_history),
             "total_risk_rejections": risk_manager.rejected_orders,
+            "open_orders": len(order_manager.get_open_orders()),
             "markets_seen": sorted(markets_seen),
             "markets_traded": sorted(markets_traded),
             "final_positions": {
@@ -268,6 +269,7 @@ def run_bot(config: BotConfig) -> None:
     iteration = 0
     current_condition_id: str | None = None
     current_market_slug: str | None = None
+    last_snapshot: MarketSnapshot | None = None
     try:
         while config.max_iterations is None or iteration < config.max_iterations:
             iteration += 1
@@ -295,10 +297,21 @@ def run_bot(config: BotConfig) -> None:
                     reason="market snapshot unavailable",
                     market_data_mode=config.market_data_mode,
                 )
+                _handle_stale_market_lifecycle(
+                    last_snapshot=last_snapshot,
+                    order_manager=order_manager,
+                    position_manager=position_manager,
+                    logger=logger,
+                    event_logger=event_logger,
+                    iteration=iteration,
+                    block_new_seconds=config.expiry_block_new_seconds,
+                    cancel_seconds=config.expiry_cancel_seconds,
+                )
                 if config.max_iterations is None or iteration < config.max_iterations:
                     time.sleep(config.market_update_interval_seconds)
                 continue
 
+            last_snapshot = snapshot
             if current_condition_id is None:
                 _log_market_selected(event_logger, logger, snapshot, config, iteration)
             elif snapshot.condition_id != current_condition_id:
@@ -371,7 +384,7 @@ def run_bot(config: BotConfig) -> None:
             position_manager.update_unrealized_pnl(snapshot)
             _log_position_event(event_logger, iteration, snapshot, position_manager)
 
-            if seconds_to_expiry is not None and seconds_to_expiry <= FORCED_EXIT_CANCEL_SECONDS:
+            if _forced_exit_required(snapshot, config.expiry_cancel_seconds):
                 cancel_all_open_orders(
                     order_manager,
                     iteration=iteration,
@@ -384,6 +397,7 @@ def run_bot(config: BotConfig) -> None:
                     logger=logger,
                     event_logger=event_logger,
                     iteration=iteration,
+                    max_exit_order_size=config.max_order_size,
                 )
             else:
                 cancel_all_open_orders(
@@ -391,7 +405,7 @@ def run_bot(config: BotConfig) -> None:
                     iteration=iteration,
                     cancel_reason="stale_quote_refresh",
                 )
-                if not _new_positions_blocked(snapshot):
+                if not _new_positions_blocked(snapshot, config.expiry_block_new_seconds):
                     _place_test_orders(
                         snapshot=snapshot,
                         order_manager=order_manager,
@@ -443,6 +457,14 @@ def run_bot(config: BotConfig) -> None:
         event_logger.emit("error", level="ERROR", error="fatal error in paper bot loop")
         raise
     finally:
+        cancelled_on_shutdown = cancel_all_open_orders(
+            order_manager,
+            iteration=iteration if iteration > 0 else None,
+            cancel_reason="session_shutdown",
+        )
+        if cancelled_on_shutdown:
+            with log_context(event="session_finished", iteration=iteration if iteration > 0 else None):
+                logger.info("Cancelled open paper orders on shutdown | count=%d", cancelled_on_shutdown)
         ended_at = datetime.now(timezone.utc)
         summary = _build_session_summary(
             event_logger=event_logger,
@@ -459,6 +481,7 @@ def run_bot(config: BotConfig) -> None:
             total_orders=summary["total_orders"],
             total_fills=summary["total_fills"],
             total_risk_rejections=summary["total_risk_rejections"],
+            open_orders=summary["open_orders"],
         )
         event_logger.write_summary(summary)
         with log_context(event="session_finished"):
@@ -482,6 +505,22 @@ def cancel_all_open_orders(
 
     cancelled_count = 0
     for order in order_manager.get_open_orders():
+        if order_manager.cancel_order(order.order_id, cancel_reason=cancel_reason, iteration=iteration):
+            cancelled_count += 1
+    return cancelled_count
+
+
+def cancel_open_orders_for_condition(
+    order_manager: OrderManager,
+    condition_id: str,
+    *,
+    iteration: int | None = None,
+    cancel_reason: str = "stale_market_lifecycle",
+) -> int:
+    """Cancel active orders that belong to the given condition."""
+
+    cancelled_count = 0
+    for order in order_manager.get_open_orders_for_condition(condition_id):
         if order_manager.cancel_order(order.order_id, cancel_reason=cancel_reason, iteration=iteration):
             cancelled_count += 1
     return cancelled_count
@@ -568,9 +607,12 @@ def _place_test_orders(
 ) -> None:
     """Place simple passive test quotes around YES and NO books.
 
-    BUY quotes are always eligible subject to risk checks. SELL quotes are only
-    proposed when spot inventory can cover the full test order size, which keeps
-    normal logs free from predictable naked-short rejections.
+    BUY quotes are normally eligible subject to risk checks. If current-market
+    inventory is too skewed, the strategy stops buying the overloaded outcome
+    and focuses exits on that side before the risk manager has to reject orders.
+    SELL quotes are only proposed when spot inventory can cover the full test
+    order size, which keeps normal logs free from predictable naked-short
+    rejections.
     """
 
     size = config.default_order_size
@@ -578,36 +620,118 @@ def _place_test_orders(
     fair_yes = snapshot.yes.midpoint
     fair_no = snapshot.no.midpoint
     base_spread = ((snapshot.yes.best_ask - snapshot.yes.best_bid) + (snapshot.no.best_ask - snapshot.no.best_bid)) / 2.0
-    proposals = [
-        (Token.YES, Side.BUY, snapshot.yes.best_bid - config.strategy_quote_offset),
-        (Token.NO, Side.BUY, snapshot.no.best_bid - config.strategy_quote_offset),
-    ]
+    inventory_skew = _inventory_skew_ratio(
+        market_position.inventory_imbalance,
+        config.max_inventory_imbalance,
+    )
+    skew_threshold = min(max(config.inventory_skew_disable_ratio, 0.0), 1.0)
+    yes_heavy = inventory_skew >= skew_threshold
+    no_heavy = inventory_skew <= -skew_threshold
+    proposals: list[tuple[Token, Side, float, str]] = []
     skipped_quotes: list[dict[str, object]] = []
 
-    if market_position.yes_position >= size:
-        proposals.append((Token.YES, Side.SELL, snapshot.yes.best_ask + config.strategy_quote_offset))
-    else:
+    def skip_quote(outcome: Token, side: Side, reason: str, **fields: object) -> None:
         skipped_quotes.append(
             {
-                "outcome": Token.YES,
-                "side": Side.SELL,
-                "reason": "insufficient YES inventory for spot SELL",
-                "current_position": market_position.yes_position,
-                "required_size": size,
+                "outcome": outcome,
+                "side": side,
+                "reason": reason,
+                "inventory_imbalance": market_position.inventory_imbalance,
+                "inventory_skew": inventory_skew,
+                **fields,
             }
         )
 
-    if market_position.no_position >= size:
-        proposals.append((Token.NO, Side.SELL, snapshot.no.best_ask + config.strategy_quote_offset))
+    if yes_heavy:
+        skip_quote(
+            Token.YES,
+            Side.BUY,
+            "inventory skew blocks BUY YES",
+        )
     else:
-        skipped_quotes.append(
-            {
-                "outcome": Token.NO,
-                "side": Side.SELL,
-                "reason": "insufficient NO inventory for spot SELL",
-                "current_position": market_position.no_position,
-                "required_size": size,
-            }
+        proposals.append(
+            (
+                Token.YES,
+                Side.BUY,
+                snapshot.yes.best_bid - config.strategy_quote_offset,
+                "test_quote",
+            )
+        )
+
+    if no_heavy:
+        skip_quote(
+            Token.NO,
+            Side.BUY,
+            "inventory skew blocks BUY NO",
+        )
+    else:
+        proposals.append(
+            (
+                Token.NO,
+                Side.BUY,
+                snapshot.no.best_bid - config.strategy_quote_offset,
+                "test_quote",
+            )
+        )
+
+    if market_position.yes_position < size:
+        skip_quote(
+            Token.YES,
+            Side.SELL,
+            "insufficient YES inventory for spot SELL",
+            current_position=market_position.yes_position,
+            required_size=size,
+        )
+    elif no_heavy:
+        skip_quote(
+            Token.YES,
+            Side.SELL,
+            "inventory skew avoids SELL YES while NO-heavy",
+            current_position=market_position.yes_position,
+        )
+    else:
+        raw_price = (
+            snapshot.yes.best_ask - config.strategy_quote_offset
+            if yes_heavy
+            else snapshot.yes.best_ask + config.strategy_quote_offset
+        )
+        proposals.append(
+            (
+                Token.YES,
+                Side.SELL,
+                raw_price,
+                "inventory_rebalance" if yes_heavy else "test_quote",
+            )
+        )
+
+    if market_position.no_position < size:
+        skip_quote(
+            Token.NO,
+            Side.SELL,
+            "insufficient NO inventory for spot SELL",
+            current_position=market_position.no_position,
+            required_size=size,
+        )
+    elif yes_heavy:
+        skip_quote(
+            Token.NO,
+            Side.SELL,
+            "inventory skew avoids SELL NO while YES-heavy",
+            current_position=market_position.no_position,
+        )
+    else:
+        raw_price = (
+            snapshot.no.best_ask - config.strategy_quote_offset
+            if no_heavy
+            else snapshot.no.best_ask + config.strategy_quote_offset
+        )
+        proposals.append(
+            (
+                Token.NO,
+                Side.SELL,
+                raw_price,
+                "inventory_rebalance" if no_heavy else "test_quote",
+            )
         )
 
     proposed_quotes = [
@@ -617,8 +741,9 @@ def _place_test_orders(
             "raw_price": raw_price,
             "price": min(max(raw_price, config.min_price), config.max_price),
             "size": size,
+            "reason": reason,
         }
-        for outcome, side, raw_price in proposals
+        for outcome, side, raw_price, reason in proposals
     ]
     if event_logger is not None:
         event_logger.emit(
@@ -630,13 +755,15 @@ def _place_test_orders(
             fair_no=fair_no,
             base_spread=base_spread,
             quote_offset=config.strategy_quote_offset,
-            inventory_skew=market_position.inventory_imbalance,
+            inventory_imbalance=market_position.inventory_imbalance,
+            inventory_skew=inventory_skew,
+            inventory_skew_disable_ratio=skew_threshold,
             proposed_quotes=proposed_quotes,
             skipped_quotes=skipped_quotes,
             skip_reasons=[str(item["reason"]) for item in skipped_quotes],
         )
 
-    for outcome, side, raw_price in proposals:
+    for outcome, side, raw_price, reason in proposals:
         price = min(max(raw_price, config.min_price), config.max_price)
         order_manager.place_limit_order(
             market_snapshot=snapshot,
@@ -645,8 +772,119 @@ def _place_test_orders(
             price=price,
             size=size,
             iteration=iteration,
-            reason="test_quote",
+            reason=reason,
         )
+
+
+def _inventory_skew_ratio(inventory_imbalance: float, max_inventory_imbalance: float) -> float:
+    """Return inventory imbalance normalized to the configured hard limit."""
+
+    if max_inventory_imbalance <= 0:
+        return 0.0
+    return inventory_imbalance / max_inventory_imbalance
+
+
+def _handle_stale_market_lifecycle(
+    *,
+    last_snapshot: MarketSnapshot | None,
+    order_manager: OrderManager,
+    position_manager: PositionManager,
+    logger: logging.Logger,
+    event_logger: StructuredEventLogger | None = None,
+    iteration: int | None = None,
+    block_new_seconds: float = FORCED_EXIT_BLOCK_NEW_SECONDS,
+    cancel_seconds: float = FORCED_EXIT_CANCEL_SECONDS,
+) -> None:
+    """Apply expiry safeguards when fresh market data is unavailable."""
+
+    if last_snapshot is None:
+        return
+
+    seconds_to_expiry = _seconds_to_expiry(last_snapshot)
+    if seconds_to_expiry is None:
+        return
+
+    position = position_manager.ensure_market(last_snapshot)
+    if seconds_to_expiry <= block_new_seconds:
+        with log_context(
+            event="forced_exit",
+            iteration=iteration,
+            market_slug=last_snapshot.market_slug,
+            condition_id=last_snapshot.condition_id,
+        ):
+            logger.info(
+                "Stale market block-new guard active | market_slug=%s condition_id=%s "
+                "seconds_to_expiry=%.1f block_new_seconds=%.1f",
+                last_snapshot.market_slug,
+                last_snapshot.condition_id,
+                seconds_to_expiry,
+                block_new_seconds,
+            )
+        if event_logger is not None:
+            event_logger.emit(
+                "forced_exit",
+                iteration=iteration,
+                market_slug=last_snapshot.market_slug,
+                condition_id=last_snapshot.condition_id,
+                seconds_to_expiry=seconds_to_expiry,
+                action="stale_market_block_new_positions",
+                block_new_seconds=block_new_seconds,
+            )
+
+    if seconds_to_expiry <= cancel_seconds:
+        cancelled = cancel_open_orders_for_condition(
+            order_manager,
+            last_snapshot.condition_id,
+            iteration=iteration,
+            cancel_reason="stale_market_expiry_guard",
+        )
+        with log_context(
+            event="forced_exit",
+            iteration=iteration,
+            market_slug=last_snapshot.market_slug,
+            condition_id=last_snapshot.condition_id,
+        ):
+            logger.warning(
+                "Stale market expiry guard active | market_slug=%s condition_id=%s "
+                "seconds_to_expiry=%.1f cancel_seconds=%.1f cancelled_orders=%d",
+                last_snapshot.market_slug,
+                last_snapshot.condition_id,
+                seconds_to_expiry,
+                cancel_seconds,
+                cancelled,
+            )
+        if event_logger is not None:
+            event_logger.emit(
+                "forced_exit",
+                level="WARNING",
+                iteration=iteration,
+                market_slug=last_snapshot.market_slug,
+                condition_id=last_snapshot.condition_id,
+                seconds_to_expiry=seconds_to_expiry,
+                action="stale_market_expiry_guard",
+                cancel_seconds=cancel_seconds,
+                cancelled_orders=cancelled,
+            )
+
+    has_inventory = position.yes_position > 1e-9 or position.no_position > 1e-9
+    if seconds_to_expiry <= 0 and has_inventory and not position.unresolved_inventory:
+        position_manager.archive_unresolved_inventory(
+            last_snapshot.condition_id,
+            "market data unavailable through expiry; inventory could not be settled or exited",
+        )
+        if event_logger is not None:
+            event_logger.emit(
+                "forced_exit",
+                level="WARNING",
+                iteration=iteration,
+                market_slug=last_snapshot.market_slug,
+                condition_id=last_snapshot.condition_id,
+                seconds_to_expiry=seconds_to_expiry,
+                action="archive_unresolved_inventory_stale_data",
+                yes_position=position.yes_position,
+                no_position=position.no_position,
+                reason=position.unresolved_reason,
+            )
 
 
 def _attempt_forced_exit(
@@ -656,6 +894,7 @@ def _attempt_forced_exit(
     logger: logging.Logger,
     event_logger: StructuredEventLogger | None = None,
     iteration: int | None = None,
+    max_exit_order_size: float = DEFAULT_CONFIG.max_order_size,
 ) -> None:
     """Try to close current-market inventory using paper-only crossing SELL orders."""
 
@@ -692,15 +931,44 @@ def _attempt_forced_exit(
     for outcome, position_size, exit_price in exit_specs:
         if position_size <= 1e-9:
             continue
-        order_manager.place_limit_order(
-            market_snapshot=snapshot,
-            outcome=outcome,
-            side=Side.SELL,
-            price=exit_price,
-            size=position_size,
+        chunks = _split_exit_chunks(position_size, max_exit_order_size)
+        with log_context(
+            event="forced_exit",
             iteration=iteration,
-            reason="forced_exit",
-        )
+            market_slug=snapshot.market_slug,
+            condition_id=snapshot.condition_id,
+        ):
+            logger.info(
+                "Forced-exit chunked orders | outcome=%s total_position=%.8f "
+                "max_chunk_size=%.8f number_of_chunks=%d",
+                outcome,
+                position_size,
+                max_exit_order_size,
+                len(chunks),
+            )
+        if event_logger is not None:
+            event_logger.emit(
+                "forced_exit",
+                iteration=iteration,
+                market_slug=snapshot.market_slug,
+                condition_id=snapshot.condition_id,
+                action="chunk_exit_orders",
+                outcome=outcome,
+                total_position=position_size,
+                chunk_size=max_exit_order_size,
+                number_of_chunks=len(chunks),
+                chunks=chunks,
+            )
+        for chunk_size in chunks:
+            order_manager.place_limit_order(
+                market_snapshot=snapshot,
+                outcome=outcome,
+                side=Side.SELL,
+                price=exit_price,
+                size=chunk_size,
+                iteration=iteration,
+                reason="forced_exit_chunk",
+            )
 
     fills = order_manager.update_orders_from_market(snapshot, iteration=iteration)
     position_manager.apply_fills(fills)
@@ -729,6 +997,23 @@ def _attempt_forced_exit(
             )
 
 
+def _split_exit_chunks(position_size: float, max_exit_order_size: float) -> list[float]:
+    """Split one exit position into order sizes accepted by risk limits."""
+
+    if position_size <= 1e-9:
+        return []
+    if max_exit_order_size <= 0:
+        raise ValueError(f"max_exit_order_size must be positive, got {max_exit_order_size}")
+
+    chunks: list[float] = []
+    remaining = position_size
+    while remaining > 1e-9:
+        chunk_size = min(max_exit_order_size, remaining)
+        chunks.append(round(chunk_size, 8))
+        remaining = max(remaining - chunk_size, 0.0)
+    return chunks
+
+
 def _seconds_to_expiry(snapshot: MarketSnapshot) -> float | None:
     """Return seconds to expiry for snapshots that expose an expiry time."""
 
@@ -740,11 +1025,24 @@ def _seconds_to_expiry(snapshot: MarketSnapshot) -> float | None:
     return (expiry_time - datetime.now(timezone.utc)).total_seconds()
 
 
-def _new_positions_blocked(snapshot: MarketSnapshot) -> bool:
+def _forced_exit_required(
+    snapshot: MarketSnapshot,
+    cancel_seconds: float = FORCED_EXIT_CANCEL_SECONDS,
+) -> bool:
+    """Return whether open orders should be cancelled and inventory exited."""
+
+    seconds_to_expiry = _seconds_to_expiry(snapshot)
+    return seconds_to_expiry is not None and seconds_to_expiry <= cancel_seconds
+
+
+def _new_positions_blocked(
+    snapshot: MarketSnapshot,
+    block_new_seconds: float = FORCED_EXIT_BLOCK_NEW_SECONDS,
+) -> bool:
     """Return whether opening new positions is blocked by the expiry guard."""
 
     seconds_to_expiry = _seconds_to_expiry(snapshot)
-    return seconds_to_expiry is not None and seconds_to_expiry <= FORCED_EXIT_BLOCK_NEW_SECONDS
+    return seconds_to_expiry is not None and seconds_to_expiry <= block_new_seconds
 
 
 def parse_args() -> argparse.Namespace:
@@ -768,6 +1066,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_CONFIG.default_order_size,
         help="Paper order size for each test quote.",
+    )
+    parser.add_argument(
+        "--inventory-skew-disable-ratio",
+        type=float,
+        default=DEFAULT_CONFIG.inventory_skew_disable_ratio,
+        help="Disable overloaded-side BUY quotes when abs(inventory skew) reaches this ratio.",
+    )
+    parser.add_argument(
+        "--expiry-block-new-seconds",
+        type=float,
+        default=DEFAULT_CONFIG.expiry_block_new_seconds,
+        help="Seconds before expiry when opening new positions is blocked.",
+    )
+    parser.add_argument(
+        "--expiry-cancel-seconds",
+        type=float,
+        default=DEFAULT_CONFIG.expiry_cancel_seconds,
+        help="Seconds before expiry when open orders are cancelled and forced exit is attempted.",
     )
     parser.add_argument(
         "--initial-cash",
@@ -819,6 +1135,9 @@ def main() -> None:
         initial_cash=args.initial_cash,
         market_update_interval_seconds=args.interval,
         default_order_size=args.order_size,
+        inventory_skew_disable_ratio=args.inventory_skew_disable_ratio,
+        expiry_block_new_seconds=args.expiry_block_new_seconds,
+        expiry_cancel_seconds=args.expiry_cancel_seconds,
         max_iterations=None if args.iterations == 0 else args.iterations,
         random_seed=args.seed,
         market_data_mode=args.market_data_mode,

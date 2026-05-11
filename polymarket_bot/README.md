@@ -195,9 +195,29 @@ fill size to available top-of-book size. If the top size is larger than the
 remaining order size, the order is fully filled.
 
 Before placing a fresh set of test quotes, the bot cancels all stale open or
-partially filled orders. The test strategy always considers BUY quotes, but it
+partially filled orders. The test strategy normally considers BUY quotes, but it
 only proposes SELL quotes when current spot inventory can cover the full order
 size.
+
+## Inventory Skew
+
+The strategy now reacts before the risk manager has to block obviously skewed
+quotes. It computes:
+
+```text
+inventory_skew = (yes_position - no_position) / max_inventory_imbalance
+```
+
+When `inventory_skew >= inventory_skew_disable_ratio`, the market is YES-heavy:
+
+- `BUY YES` is skipped.
+- `SELL YES` is preferred when YES inventory is available.
+- `BUY NO` remains allowed.
+- `SELL NO` is skipped while the bot is trying to reduce YES exposure.
+
+When `inventory_skew <= -inventory_skew_disable_ratio`, the same rule is applied
+in the opposite direction for NO-heavy inventory. Skipped quotes are included in
+the `strategy_decision` event with explicit reasons.
 
 ## Spot Accounting
 
@@ -229,11 +249,29 @@ When the selected 15-minute market changes, open orders from the previous
 `condition_id` are cancelled. If a market is near expiry, forced-exit guardrails
 apply:
 
-- Less than 90 seconds to expiry: do not open new positions.
-- Less than 60 seconds to expiry: cancel open orders and try to close current
+- Less than 180 seconds to expiry: do not open new positions.
+- Less than 150 seconds to expiry: cancel open orders and try to close current
   market inventory in paper mode.
 - If paper exit cannot close all inventory, the market ledger is archived with
   unresolved inventory.
+
+Forced-exit SELL orders are chunked by `max_order_size`. For example, a YES
+inventory of `21.3` with `max_order_size=10` becomes three paper SELL orders:
+`10`, `10`, and `1.3`. These are still paper-only limit orders and still pass
+through the same `RiskManager`; no real order routing exists in this project.
+Structured `forced_exit` events include chunk metadata, and each exit order is
+tagged with `reason="forced_exit_chunk"`.
+
+If fresh market data becomes unavailable near expiry, the bot still uses the
+last known `expiry_time` for lifecycle protection. In that stale-data path it
+cancels active orders for the last known condition inside the same 150-second
+cancel guard window, blocks new positions inside the same 180-second block-new
+window, and if the market expires before a fresh snapshot returns, any remaining
+inventory is archived as unresolved instead of silently looking settled.
+
+On session shutdown, all remaining open or partially filled paper orders are
+cancelled with `cancel_reason="session_shutdown"` before `summary.json` is
+written, so the final summary reports zero open orders.
 
 ## Tests
 
