@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass, field
+from datetime import timedelta
 
+from .logger import log_context
 from .models import MarketSnapshot, TokenMarketSnapshot, utc_now
 
 
@@ -42,18 +44,34 @@ class MockMarketDataGenerator:
         yes = self._make_token_snapshot(yes_mid, spread_yes)
         no = self._make_token_snapshot(no_mid, spread_no)
 
-        snapshot = MarketSnapshot(yes=yes, no=no, timestamp=utc_now())
-        self.logger.info(
-            "Market snapshot | YES %.3f/%.3f size %.2f/%.2f | NO %.3f/%.3f size %.2f/%.2f",
-            snapshot.yes.best_bid,
-            snapshot.yes.best_ask,
-            snapshot.yes.bid_size,
-            snapshot.yes.ask_size,
-            snapshot.no.best_bid,
-            snapshot.no.best_ask,
-            snapshot.no.bid_size,
-            snapshot.no.ask_size,
+        now = utc_now()
+        snapshot = MarketSnapshot(
+            yes=yes,
+            no=no,
+            condition_id="mock-btc-15m-condition",
+            market_slug="mock-btc-15m",
+            yes_token_id="mock-btc-15m-yes",
+            no_token_id="mock-btc-15m-no",
+            market_question="Mock BTC 15-minute prediction market",
+            expiry_time=now + timedelta(minutes=15),
+            timestamp=now,
         )
+        with log_context(
+            event="snapshot",
+            market_slug=snapshot.market_slug,
+            condition_id=snapshot.condition_id,
+        ):
+            self.logger.info(
+                "Market snapshot | YES %.3f/%.3f size %.2f/%.2f | NO %.3f/%.3f size %.2f/%.2f",
+                snapshot.yes.best_bid,
+                snapshot.yes.best_ask,
+                snapshot.yes.bid_size,
+                snapshot.yes.ask_size,
+                snapshot.no.best_bid,
+                snapshot.no.best_ask,
+                snapshot.no.bid_size,
+                snapshot.no.ask_size,
+            )
         return snapshot
 
     def _move_fair_value(self) -> None:

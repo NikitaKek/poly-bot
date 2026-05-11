@@ -61,19 +61,33 @@ class MarketSnapshot:
 
     yes: TokenMarketSnapshot
     no: TokenMarketSnapshot
+    condition_id: str
+    market_slug: str
+    yes_token_id: str
+    no_token_id: str
+    market_question: str = ""
+    expiry_time: datetime | None = None
     timestamp: datetime = field(default_factory=utc_now)
 
-    def token_snapshot(self, token: Token) -> TokenMarketSnapshot:
-        """Return the snapshot for a specific token."""
+    def token_snapshot(self, outcome: Token) -> TokenMarketSnapshot:
+        """Return the snapshot for a specific outcome."""
 
-        return self.yes if token == Token.YES else self.no
+        return self.yes if outcome == Token.YES else self.no
+
+    def token_id(self, outcome: Token) -> str:
+        """Return the CLOB token id for a specific outcome."""
+
+        return self.yes_token_id if outcome == Token.YES else self.no_token_id
 
 
 @dataclass(slots=True)
 class Order:
     """Paper limit order tracked by the order manager."""
 
-    token: Token
+    condition_id: str
+    market_slug: str
+    token_id: str
+    outcome: Token
     side: Side
     price: float
     size: float
@@ -82,6 +96,12 @@ class Order:
     status: OrderStatus = OrderStatus.OPEN
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+
+    @property
+    def token(self) -> Token:
+        """Backward-compatible alias for outcome."""
+
+        return self.outcome
 
     @property
     def remaining_size(self) -> float:
@@ -117,11 +137,20 @@ class Fill:
     """Execution report emitted by the paper exchange."""
 
     order_id: str
-    token: Token
+    condition_id: str
+    market_slug: str
+    token_id: str
+    outcome: Token
     side: Side
     price: float
     size: float
     timestamp: datetime = field(default_factory=utc_now)
+
+    @property
+    def token(self) -> Token:
+        """Backward-compatible alias for outcome."""
+
+        return self.outcome
 
     @property
     def notional(self) -> float:

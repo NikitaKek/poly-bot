@@ -67,10 +67,16 @@ Run with public Polymarket market data while keeping paper-only execution:
 python -m polymarket_bot.main --market-data-mode polymarket --iterations 0
 ```
 
-Logs are written to:
+Each run creates a dedicated paper-trading session directory:
 
 ```text
-logs/bot.log
+logs/sessions/<session_id>/
+```
+
+The `session_id` format is:
+
+```text
+YYYYMMDD_HHMMSS_<market_data_mode>_paper
 ```
 
 ## What Each Module Does
@@ -81,10 +87,78 @@ logs/bot.log
 - `polymarket_market_data.py`: public Gamma market discovery and public CLOB order book snapshots.
 - `paper_exchange.py`: paper limit-order execution against the current best bid/ask.
 - `order_manager.py`: places, cancels, stores, and updates paper orders.
-- `position_manager.py`: tracks cash, spot YES/NO inventory, average cost, fills, realized PnL, unrealized PnL, and equity.
+- `position_manager.py`: tracks cash plus market-specific spot YES/NO inventory, average cost, fills, realized PnL, unrealized PnL, unresolved inventory, and equity.
 - `risk_manager.py`: validates price, size, cash, spot inventory, open-order exposure, and inventory imbalance limits before orders are accepted.
-- `logger.py`: logs to console and `logs/bot.log`.
+- `logger.py`: session-aware human logs, structured JSONL events, CSV exports, config snapshots, and session summaries.
 - `main.py`: runs the paper-trading loop and places simple test quotes.
+
+## Session Logs
+
+Every run writes artifacts under:
+
+```text
+logs/sessions/<session_id>/
+  bot.log
+  events.jsonl
+  summary.json
+  config.json
+  markets/
+    <market_slug>.jsonl
+  csv/
+    snapshots.csv
+    orders.csv
+    fills.csv
+    positions.csv
+    risk_rejections.csv
+```
+
+`bot.log` remains human-readable and includes session, event, iteration, market
+slug, and condition id context:
+
+```text
+2026-05-11 14:00:45 | INFO | session=20260511_140045_mock_paper | event=snapshot | iteration=1 | market=mock-btc-15m | condition=mock-btc-15m-condition | Snapshot | YES 0.489/0.504 | NO 0.496/0.511
+```
+
+`events.jsonl` contains one valid JSON object per line for analysis:
+
+```json
+{"event":"snapshot","session_id":"20260511_140045_mock_paper","iteration":1,"market_slug":"mock-btc-15m","condition_id":"mock-btc-15m-condition","yes_bid":0.489,"yes_ask":0.504,"no_bid":0.496,"no_ask":0.511}
+{"event":"order_placed","session_id":"20260511_140045_mock_paper","order_id":"...","outcome":"YES","side":"BUY","price":0.479,"size":5.0,"reason":"test_quote"}
+```
+
+Structured event types include `session_started`, `session_finished`,
+`market_selected`, `market_rollover`, `snapshot`, `strategy_decision`,
+`order_placed`, `order_cancelled`, `fill`, `position`, `risk_rejection`,
+`market_data_unavailable`, `forced_exit`, and `error`.
+
+Events that include `market_slug` are also appended to
+`markets/<market_slug>.jsonl`, which makes it easy to inspect one 15-minute
+market without filtering the full session file.
+
+To inspect fills with Python, optionally using pandas:
+
+```python
+import pandas as pd
+
+fills = pd.read_csv("logs/sessions/20260511_140045_mock_paper/csv/fills.csv")
+fills["pnl_hint"] = fills["notional"]
+print(fills[["ts", "market_slug", "outcome", "side", "price", "size", "notional"]])
+```
+
+If you want to avoid pandas:
+
+```python
+import csv
+
+with open("logs/sessions/20260511_140045_mock_paper/csv/fills.csv", newline="", encoding="utf-8") as file:
+    for row in csv.DictReader(file):
+        print(row["ts"], row["market_slug"], row["outcome"], row["side"], row["price"], row["size"])
+```
+
+`summary.json` is written at the end of the run and contains ending cash,
+ending equity, realized/unrealized PnL, max/min equity, max drawdown, total
+orders, total fills, total risk rejections, markets seen/traded, and final
+market-specific positions.
 
 ## Market Data Modes
 
@@ -129,6 +203,8 @@ size.
 
 This MVP uses a simple spot-only accounting model:
 
+- YES/NO inventory is scoped to a specific `condition_id` and `token_id`.
+- Inventory from one 15-minute market is never reused in the next 15-minute market.
 - Naked short selling is blocked.
 - A `SELL` order is accepted only when available inventory for that token is at
   least the order size.
@@ -149,6 +225,16 @@ equity = cash + yes_position * yes_mark_price + no_position * no_mark_price
 If a fill would make YES or NO inventory negative, the bot logs a critical error
 and raises an accounting exception.
 
+When the selected 15-minute market changes, open orders from the previous
+`condition_id` are cancelled. If a market is near expiry, forced-exit guardrails
+apply:
+
+- Less than 90 seconds to expiry: do not open new positions.
+- Less than 60 seconds to expiry: cancel open orders and try to close current
+  market inventory in paper mode.
+- If paper exit cannot close all inventory, the market ledger is archived with
+  unresolved inventory.
+
 ## Tests
 
 Run the unit tests:
@@ -160,13 +246,12 @@ python -m unittest discover -s tests -v
 ## Example Output
 
 ```text
-2026-05-07 12:00:00 | INFO | polymarket_bot | Starting Polymarket BTCUSDT 15m paper bot
-2026-05-07 12:00:00 | INFO | polymarket_bot | Market snapshot | YES 0.487/0.509 size 9.46/19.73 | NO 0.480/0.506 size 22.84/6.74
-2026-05-07 12:00:00 | INFO | polymarket_bot | Iteration 1 | YES 0.487/0.509 | NO 0.480/0.506
-2026-05-07 12:00:00 | INFO | polymarket_bot | Positions | starting_cash=1000.00 cash=1000.00 yes_position=0.0000 no_position=0.0000 yes_avg_cost=0.0000 no_avg_cost=0.0000 imbalance=0.0000 realized_pnl=0.00 unrealized_pnl=0.00 equity=1000.00
-2026-05-07 12:00:00 | INFO | polymarket_bot | Orders | open_orders=0 rejected_orders=0
-2026-05-07 12:00:00 | INFO | polymarket_bot | Placed paper order | order=... BUY YES size=5.0000 price=0.477
-2026-05-07 12:00:00 | WARNING | polymarket_bot | Risk rejection | naked short blocked: SELL 5.0000 YES requested with available spot inventory 0.0000
+2026-05-11 14:00:45 | INFO | session=20260511_140045_mock_paper | event=session_started | iteration=- | market=- | condition=- | Starting Polymarket BTCUSDT 15m paper bot
+2026-05-11 14:00:45 | INFO | session=20260511_140045_mock_paper | event=market_selected | iteration=1 | market=mock-btc-15m | condition=mock-btc-15m-condition | Selected market | question=Mock BTC 15-minute prediction market slug=mock-btc-15m
+2026-05-11 14:00:45 | INFO | session=20260511_140045_mock_paper | event=snapshot | iteration=1 | market=mock-btc-15m | condition=mock-btc-15m-condition | Snapshot | YES 0.489/0.504 | NO 0.496/0.511
+2026-05-11 14:00:45 | INFO | session=20260511_140045_mock_paper | event=order_placed | iteration=1 | market=mock-btc-15m | condition=mock-btc-15m-condition | Placed paper order | order=... BUY YES token_id=mock-btc-15m-yes size=5.0000 price=0.479
+2026-05-11 14:00:45 | INFO | session=20260511_140045_mock_paper | event=position | iteration=1 | market=mock-btc-15m | condition=mock-btc-15m-condition | Portfolio | starting_cash=1000.00 cash=1000.00 markets=1 realized_pnl=0.00 unrealized_pnl=0.00 total_equity=1000.00
+2026-05-11 14:00:45 | INFO | session=20260511_140045_mock_paper | event=session_finished | iteration=- | market=- | condition=- | All orders=2 fills=0 rejected_orders=0 summary=logs\sessions\20260511_140045_mock_paper\summary.json
 ```
 
 ## Next Steps for Real Polymarket Connectivity

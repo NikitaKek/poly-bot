@@ -17,6 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
+from .logger import log_context
 from .models import MarketSnapshot, Token, TokenMarketSnapshot, utc_now
 
 BTC_15M_SLUG_PREFIXES = ("btc-updown-15m", "btc-up-or-down-15m")
@@ -36,6 +37,7 @@ class DiscoveredMarket:
     condition_id: str
     yes_token_id: str
     no_token_id: str
+    expiry_time: datetime | None = None
 
 
 def parse_clob_token_ids(raw_value: Any) -> list[str]:
@@ -144,16 +146,23 @@ class MarketDiscoveryClient:
             condition_id=str(selected.get("conditionId") or selected.get("condition_id") or ""),
             yes_token_id=yes_token_id,
             no_token_id=no_token_id,
+            expiry_time=_parse_datetime(
+                selected.get("endDate")
+                or selected.get("end_date")
+                or selected.get("endDateIso")
+                or selected.get("end_date_iso")
+            ),
         )
-        self.logger.info(
-            "Selected Polymarket market | question=%s slug=%s condition_id=%s "
-            "yes_token_id=%s no_token_id=%s",
-            market.question,
-            market.slug,
-            market.condition_id,
-            market.yes_token_id,
-            market.no_token_id,
-        )
+        with log_context(event="market_selected", market_slug=market.slug, condition_id=market.condition_id):
+            self.logger.info(
+                "Selected Polymarket market | question=%s slug=%s condition_id=%s "
+                "yes_token_id=%s no_token_id=%s",
+                market.question,
+                market.slug,
+                market.condition_id,
+                market.yes_token_id,
+                market.no_token_id,
+            )
         return market
 
     def _fetch_active_markets(self) -> list[dict[str, Any]]:
@@ -335,16 +344,27 @@ class PolymarketOrderBookClient:
         if yes_snapshot is None or no_snapshot is None:
             return None
 
-        snapshot = MarketSnapshot(yes=yes_snapshot, no=no_snapshot, timestamp=utc_now())
-        self.logger.info(
-            "Polymarket snapshot | question=%s slug=%s YES %.3f/%.3f NO %.3f/%.3f",
-            market.question,
-            market.slug,
-            snapshot.yes.best_bid,
-            snapshot.yes.best_ask,
-            snapshot.no.best_bid,
-            snapshot.no.best_ask,
+        snapshot = MarketSnapshot(
+            yes=yes_snapshot,
+            no=no_snapshot,
+            condition_id=market.condition_id,
+            market_slug=market.slug,
+            yes_token_id=market.yes_token_id,
+            no_token_id=market.no_token_id,
+            market_question=market.question,
+            expiry_time=market.expiry_time,
+            timestamp=utc_now(),
         )
+        with log_context(event="snapshot", market_slug=snapshot.market_slug, condition_id=snapshot.condition_id):
+            self.logger.info(
+                "Polymarket snapshot | question=%s slug=%s YES %.3f/%.3f NO %.3f/%.3f",
+                market.question,
+                market.slug,
+                snapshot.yes.best_bid,
+                snapshot.yes.best_ask,
+                snapshot.no.best_bid,
+                snapshot.no.best_ask,
+            )
         return snapshot
 
     def get_orderbook(self, token_id: str) -> dict[str, Any]:
@@ -490,6 +510,28 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+
+    raw_value = value.strip()
+    if not raw_value:
+        return None
+    if len(raw_value) == 10 and raw_value[4] == "-" and raw_value[7] == "-":
+        raw_value = f"{raw_value}T00:00:00+00:00"
+    if raw_value.endswith("Z"):
+        raw_value = raw_value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _normalize_text(value: str) -> str:
